@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -430,9 +429,9 @@ func createRun(opts *CreateOptions) error {
 		pushTries := 0
 		maxPushTries := 3
 		for {
-			regexp := regexp.MustCompile("^remote: (|Create a pull request for '.*' on GitHub by visiting:.*|.*https://github\\.com/.*/pull/new/.*)$")
-			cmdErr := NewRegexWriter(os.Stderr, regexp, "")
-			cmdOut := os.Stdout
+			regexp := regexp.MustCompile("^remote: (Create a pull request.*by visiting|[[:space:]]*https://.*/pull/new/).*\n?$")
+			cmdErr := NewRegexWriter(opts.IO.ErrOut, regexp, "")
+			cmdOut := opts.IO.Out
 			if err := git.Push(headRemote.Name, fmt.Sprintf("HEAD:%s", headBranch), cmdOut, cmdErr); err != nil {
 				if didForkRepo && pushTries < maxPushTries {
 					pushTries++
