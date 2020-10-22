@@ -55,6 +55,10 @@ func NewHelpTopic(topic string) *cobra.Command {
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		Run:    helpTopicHelpFunc,
+		Annotations: map[string]string{
+			"GenMarkdown":      "true",
+			"MarkdownFileName": "gh_help_" + topic,
+		},
 	}
 
 	cmd.SetHelpFunc(helpTopicHelpFunc)
