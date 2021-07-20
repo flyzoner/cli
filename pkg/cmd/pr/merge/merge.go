@@ -8,10 +8,8 @@ import (
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/api"
-	"github.com/cli/cli/context"
 	"github.com/cli/cli/git"
 	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/internal/ghrepo"
 	"github.com/cli/cli/pkg/cmd/pr/shared"
 	"github.com/cli/cli/pkg/cmdutil"
 	"github.com/cli/cli/pkg/iostreams"
@@ -26,11 +24,10 @@ type editor interface {
 
 type MergeOptions struct {
 	HttpClient func() (*http.Client, error)
-	Config     func() (config.Config, error)
 	IO         *iostreams.IOStreams
-	BaseRepo   func() (ghrepo.Interface, error)
-	Remotes    func() (context.Remotes, error)
 	Branch     func() (string, error)
+
+	Finder shared.PRFinder
 
 	SelectorArg  string
 	DeleteBranch bool
@@ -52,8 +49,6 @@ func NewCmdMerge(f *cmdutil.Factory, runF func(*MergeOptions) error) *cobra.Comm
 	opts := &MergeOptions{
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
-		Config:     f.Config,
-		Remotes:    f.Remotes,
 		Branch:     f.Branch,
 	}
 
@@ -76,8 +71,7 @@ func NewCmdMerge(f *cmdutil.Factory, runF func(*MergeOptions) error) *cobra.Comm
     	`),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// support `-R, --repo` override
-			opts.BaseRepo = f.BaseRepo
+			opts.Finder = shared.NewFinder(f)
 
 			if repoOverride, _ := cmd.Flags().GetString("repo"); repoOverride != "" && len(args) == 0 {
 				return &cmdutil.FlagError{Err: errors.New("argument required when using the --repo flag")}
@@ -136,7 +130,7 @@ func NewCmdMerge(f *cmdutil.Factory, runF func(*MergeOptions) error) *cobra.Comm
 
 			opts.Editor = &userEditor{
 				io:     opts.IO,
-				config: opts.Config,
+				config: f.Config,
 			}
 
 			if runF != nil {
@@ -160,18 +154,22 @@ func NewCmdMerge(f *cmdutil.Factory, runF func(*MergeOptions) error) *cobra.Comm
 func mergeRun(opts *MergeOptions) error {
 	cs := opts.IO.ColorScheme()
 
-	httpClient, err := opts.HttpClient()
-	if err != nil {
-		return err
+	findOptions := shared.FindOptions{
+		Selector: opts.SelectorArg,
+		Fields:   []string{"id", "number", "state", "title", "lastCommit", "mergeStateStatus", "headRepositoryOwner", "headRefName"},
 	}
-	apiClient := api.NewClientFromHTTP(httpClient)
-
-	pr, baseRepo, err := shared.PRFromArgs(apiClient, opts.BaseRepo, opts.Branch, opts.Remotes, opts.SelectorArg)
+	pr, baseRepo, err := opts.Finder.Find(findOptions)
 	if err != nil {
 		return err
 	}
 
 	isTerminal := opts.IO.IsStdoutTTY()
+
+	httpClient, err := opts.HttpClient()
+	if err != nil {
+		return err
+	}
+	apiClient := api.NewClientFromHTTP(httpClient)
 
 	if opts.AutoMergeDisable {
 		err := disableAutoMerge(httpClient, baseRepo, pr.ID)
@@ -186,28 +184,30 @@ func mergeRun(opts *MergeOptions) error {
 
 	if opts.SelectorArg == "" && len(pr.Commits.Nodes) > 0 {
 		if localBranchLastCommit, err := git.LastCommit(); err == nil {
-			if localBranchLastCommit.Sha != pr.Commits.Nodes[0].Commit.Oid {
+			if localBranchLastCommit.Sha != pr.Commits.Nodes[len(pr.Commits.Nodes)-1].Commit.OID {
 				fmt.Fprintf(opts.IO.ErrOut,
 					"%s Pull request #%d (%s) has diverged from local branch\n", cs.Yellow("!"), pr.Number, pr.Title)
 			}
 		}
 	}
 
-	if pr.Mergeable == "CONFLICTING" {
-		fmt.Fprintf(opts.IO.ErrOut, "%s Pull request #%d (%s) has conflicts and isn't mergeable\n", cs.Red("!"), pr.Number, pr.Title)
+	isPRAlreadyMerged := pr.State == "MERGED"
+	if blocked := blockedReason(pr.MergeStateStatus); !opts.AutoMergeEnable && !isPRAlreadyMerged && blocked != "" {
+		fmt.Fprintf(opts.IO.ErrOut, "%s Pull request #%d is not mergeable: %s.\n", cs.FailureIcon(), pr.Number, blocked)
+		fmt.Fprintf(opts.IO.ErrOut, "To have the pull request merged after all the requirements have been met, add the `--auto` flag.\n")
 		return cmdutil.SilentError
 	}
 
 	deleteBranch := opts.DeleteBranch
 	crossRepoPR := pr.HeadRepositoryOwner.Login != baseRepo.RepoOwner()
+	autoMerge := opts.AutoMergeEnable && !isImmediatelyMergeable(pr.MergeStateStatus)
 
-	isPRAlreadyMerged := pr.State == "MERGED"
 	if !isPRAlreadyMerged {
 		payload := mergePayload{
 			repo:          baseRepo,
 			pullRequestID: pr.ID,
 			method:        opts.MergeMethod,
-			auto:          opts.AutoMergeEnable,
+			auto:          autoMerge,
 			commitBody:    opts.Body,
 			setCommitBody: opts.BodySet,
 		}
@@ -296,7 +296,7 @@ func mergeRun(opts *MergeOptions) error {
 		fmt.Fprintf(opts.IO.ErrOut, "%s Pull request #%d was already merged\n", cs.WarningIcon(), pr.Number)
 	}
 
-	if !deleteBranch || crossRepoPR || opts.AutoMergeEnable {
+	if !deleteBranch || crossRepoPR || autoMerge {
 		return nil
 	}
 
@@ -452,4 +452,27 @@ func (e *userEditor) Edit(filename, startingText string) (string, error) {
 	}
 
 	return surveyext.Edit(editorCommand, filename, startingText, e.io.In, e.io.Out, e.io.ErrOut, nil)
+}
+
+// blockedReason translates various MergeStateStatus GraphQL values into human-readable reason
+func blockedReason(status string) string {
+	switch status {
+	case "BLOCKED":
+		return "the base branch policy prohibits the merge"
+	case "BEHIND":
+		return "the head branch is not up to date with the base branch"
+	case "DIRTY":
+		return "the merge commit cannot be cleanly created"
+	default:
+		return ""
+	}
+}
+
+func isImmediatelyMergeable(status string) bool {
+	switch status {
+	case "CLEAN", "HAS_HOOKS", "UNSTABLE":
+		return true
+	default:
+		return false
+	}
 }
